@@ -12,7 +12,7 @@ API:    /playlist.m3u       Live M3U output (Jellyfin tuner URL)
         /epg.xml            XMLTV output (Jellyfin guide URL, embedded in M3U header)
 """
 
-import csv, gzip, io, json, os, re, sqlite3, threading, time, urllib.request
+import csv, gzip, io, json as _json, json, os, re, sqlite3, subprocess, threading, time, urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, Response
@@ -70,6 +70,20 @@ def init_db():
             last_count   INTEGER DEFAULT 0,
             last_error   TEXT DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS channel_health (
+            slug        TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            is_mirror   INTEGER DEFAULT 0,
+            priority    INTEGER DEFAULT 0,
+            last_checked INTEGER DEFAULT 0,
+            status      TEXT DEFAULT 'unknown',
+            latency_ms  INTEGER DEFAULT 0,
+            http_code   INTEGER DEFAULT 0,
+            stream_info TEXT DEFAULT '',
+            error_msg   TEXT DEFAULT '',
+            PRIMARY KEY (slug, url)
+        );
         """)
 
 # ─── CSV helpers ─────────────────────────────────────────────────────────────
@@ -91,6 +105,118 @@ def write_channels(rows):
 def slugify(t):
     t = re.sub(r"[^a-z0-9\s-]", "", t.lower())
     return re.sub(r"[\s-]+", "-", t).strip("-")
+
+# ─── Health check ─────────────────────────────────────────────────────────────
+
+FFPROBE_PATHS = [
+    "/Applications/Jellyfin.app/Contents/MacOS/ffprobe",
+    "/usr/local/bin/ffprobe",
+    "/opt/homebrew/bin/ffprobe",
+    "ffprobe",
+]
+
+def _find_ffprobe():
+    import shutil
+    for p in FFPROBE_PATHS:
+        if os.path.exists(p): return p
+    return shutil.which("ffprobe")
+
+def check_stream(url, timeout=8):
+    """HTTP liveness check + optional ffprobe probe. Returns dict."""
+    result = {"url": url, "status": "error", "latency_ms": 0,
+              "http_code": 0, "stream_info": {}, "error_msg": ""}
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(url, method="GET",
+              headers={"User-Agent": "IPTV-Manager-Probe/1.0",
+                       "Range": "bytes=0-65535"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            result["http_code"] = r.status
+            r.read(4096)
+        result["latency_ms"] = int((time.time() - t0) * 1000)
+        result["status"] = "ok"
+    except urllib.error.HTTPError as e:
+        result["http_code"] = e.code
+        result["latency_ms"] = int((time.time() - t0) * 1000)
+        result["status"] = "ok" if e.code in (200, 206) else "error"
+        result["error_msg"] = str(e)
+    except Exception as e:
+        result["latency_ms"] = int((time.time() - t0) * 1000)
+        result["status"] = "timeout" if "timed out" in str(e).lower() else "error"
+        result["error_msg"] = str(e)[:120]
+        return result
+
+    # ffprobe for stream details (non-blocking, 10s timeout)
+    ffprobe = _find_ffprobe()
+    if ffprobe and result["status"] == "ok":
+        try:
+            proc = subprocess.run(
+                [ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_streams", "-select_streams", "v:0",
+                 "-i", url],
+                capture_output=True, timeout=10, text=True
+            )
+            if proc.returncode == 0:
+                data = _json.loads(proc.stdout)
+                streams = data.get("streams", [])
+                if streams:
+                    s = streams[0]
+                    info = {
+                        "codec":      s.get("codec_name", ""),
+                        "resolution": "{}x{}".format(s.get("width","?"), s.get("height","?")),
+                        "fps":        s.get("r_frame_rate", ""),
+                        "bitrate":    s.get("bit_rate", ""),
+                    }
+                    if "/" in info["fps"]:
+                        try:
+                            n, d = info["fps"].split("/")
+                            info["fps"] = "{:.2f}".format(int(n)/int(d))
+                        except Exception:
+                            pass
+                    result["stream_info"] = info
+        except Exception:
+            pass
+
+    return result
+
+HEALTH_CHECK_INTERVAL = 1800  # 30 minutes
+
+def check_all_health():
+    channels = read_channels()
+    for ch in channels:
+        name = ch.get("name","").strip()
+        slug = slugify(name)
+        url  = ch.get("url","").strip()
+        if not url or "YOUR_STREAM_URL" in url:
+            continue
+        r = check_stream(url)
+        with db() as c:
+            c.execute("""INSERT OR REPLACE INTO channel_health
+                (slug,url,is_mirror,priority,last_checked,status,latency_ms,http_code,stream_info,error_msg)
+                VALUES (?,?,0,0,?,?,?,?,?,?)""",
+                (slug, url, int(time.time()), r["status"], r["latency_ms"],
+                 r["http_code"], _json.dumps(r["stream_info"]), r["error_msg"]))
+        with db() as c2:
+            mirrors = c2.execute(
+                "SELECT * FROM channel_health WHERE slug=? AND is_mirror=1", (slug,)
+            ).fetchall()
+        for m in mirrors:
+            mr = check_stream(m["url"])
+            with db() as c3:
+                c3.execute("""UPDATE channel_health SET last_checked=?,status=?,latency_ms=?,
+                    http_code=?,stream_info=?,error_msg=? WHERE slug=? AND url=?""",
+                    (int(time.time()), mr["status"], mr["latency_ms"],
+                     mr["http_code"], _json.dumps(mr["stream_info"]), mr["error_msg"],
+                     slug, m["url"]))
+
+def _health_loop():
+    time.sleep(60)  # wait 1 min after startup before first check
+    while True:
+        try:
+            check_all_health()
+        except Exception as e:
+            print("[Health] ERROR:", e)
+        time.sleep(HEALTH_CHECK_INTERVAL)
 
 # ─── M3U parser ──────────────────────────────────────────────────────────────
 
@@ -518,6 +644,89 @@ def api_epg_refresh():
     threading.Thread(target=refresh_epg, daemon=True).start()
     return jsonify({"ok": True})
 
+# ─── Health & Mirror API ──────────────────────────────────────────────────────
+
+@app.route("/stream/<slug>")
+def stream_redirect(slug):
+    """Redirect to best working mirror for this channel."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM channel_health WHERE slug=? ORDER BY is_mirror ASC, priority ASC",
+            (slug,)
+        ).fetchall()
+    for status_pref in ("ok", "unknown", "timeout", "error"):
+        for row in rows:
+            if row["status"] == status_pref:
+                return Response("", status=302, headers={"Location": row["url"]})
+    for ch in read_channels():
+        if slugify(ch.get("name","")) == slug:
+            url = ch.get("url","").strip()
+            if url and "YOUR_STREAM_URL" not in url:
+                return Response("", status=302, headers={"Location": url})
+    return jsonify({"error": "no url found"}), 404
+
+@app.route("/api/channels/<int:idx>/mirrors", methods=["GET"])
+def api_mirrors_list(idx):
+    rows = read_channels()
+    if not 0 <= idx < len(rows): return jsonify([])
+    slug = slugify(rows[idx].get("name",""))
+    with db() as c:
+        ms = c.execute("SELECT * FROM channel_health WHERE slug=? AND is_mirror=1 ORDER BY priority", (slug,)).fetchall()
+    return jsonify([dict(m) for m in ms])
+
+@app.route("/api/channels/<int:idx>/mirrors", methods=["POST"])
+def api_mirrors_add(idx):
+    rows = read_channels()
+    if not 0 <= idx < len(rows): return jsonify({"error":"not found"}), 404
+    d = request.get_json(force=True)
+    url = d.get("url","").strip()
+    if not url: return jsonify({"error":"url required"}), 400
+    slug = slugify(rows[idx].get("name",""))
+    with db() as c:
+        max_p = c.execute("SELECT MAX(priority) FROM channel_health WHERE slug=? AND is_mirror=1",(slug,)).fetchone()[0] or 0
+        c.execute("""INSERT OR IGNORE INTO channel_health
+            (slug,url,is_mirror,priority,status) VALUES (?,?,1,?,?)""",
+            (slug, url, max_p+1, "unknown"))
+    return jsonify({"ok": True})
+
+@app.route("/api/channels/<int:idx>/mirrors/<path:url>", methods=["DELETE"])
+def api_mirrors_del(idx, url):
+    rows = read_channels()
+    if not 0 <= idx < len(rows): return jsonify({"error":"not found"}), 404
+    slug = slugify(rows[idx].get("name",""))
+    with db() as c:
+        c.execute("DELETE FROM channel_health WHERE slug=? AND url=? AND is_mirror=1",(slug, url))
+    return jsonify({"ok": True})
+
+@app.route("/api/health")
+def api_health_all():
+    with db() as c:
+        rows = c.execute("SELECT * FROM channel_health ORDER BY slug, is_mirror, priority").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/health/test", methods=["POST"])
+def api_health_test():
+    d = request.get_json(force=True)
+    url = d.get("url","").strip()
+    slug = d.get("slug","").strip()
+    is_mirror = int(d.get("is_mirror", 0))
+    if not url: return jsonify({"error":"url required"}), 400
+    result = check_stream(url)
+    if slug:
+        with db() as c:
+            c.execute("""INSERT OR REPLACE INTO channel_health
+                (slug,url,is_mirror,priority,last_checked,status,latency_ms,http_code,stream_info,error_msg)
+                VALUES (?,?,?,0,?,?,?,?,?,?)""",
+                (slug, url, is_mirror, int(time.time()), result["status"],
+                 result["latency_ms"], result["http_code"],
+                 _json.dumps(result["stream_info"]), result["error_msg"]))
+    return jsonify(result)
+
+@app.route("/api/health/test_all", methods=["POST"])
+def api_health_test_all():
+    threading.Thread(target=check_all_health, daemon=True).start()
+    return jsonify({"ok": True, "message": "Health check started in background"})
+
 # ─── Guide API ───────────────────────────────────────────────────────────────
 
 @app.route("/api/guide")
@@ -840,6 +1049,7 @@ _CHANNELS = """<!DOCTYPE html><html lang="en"><head>
   <span id="cnt" style="color:#374151;font-size:.78rem"></span>
   <span class="spacer"></span>
   <button class="btn-red btn-sm" id="bulk-del-btn" onclick="bulkDelete()" style="display:none">Delete selected</button>
+  <button class="btn-amber" onclick="testAll()" id="test-all-btn">⚡ Test All</button>
   <button class="btn-gray btn-sm" onclick="exportCsv()">↓ CSV</button>
 </div>
 <div class="notice" id="notice"></div>
@@ -847,6 +1057,7 @@ _CHANNELS = """<!DOCTYPE html><html lang="en"><head>
 <thead><tr>
   <th class="sel-col"><input type="checkbox" id="chk-all" onchange="toggleAll(this.checked)"></th>
   <th style="width:28px">#</th>
+  <th style="width:60px">Health</th>
   <th>Name</th><th>Group</th><th>Res</th>
   <th>TVG-ID</th>
   <th>Stream URL</th>
@@ -883,6 +1094,14 @@ _CHANNELS = """<!DOCTYPE html><html lang="en"><head>
   </div>
   <div class="frow"><label>Logo URL</label><input id="f-tvg_logo" placeholder="https://…/logo.png"></div>
   <div class="frow"><label>Stream URL</label><input id="f-url" placeholder="https://host/stream.m3u8"></div>
+  <div class="frow" id="mirrors-section" style="display:none">
+    <label>Mirror URLs <span class="hint" style="display:inline">(fallback if primary fails)</span></label>
+    <div id="mirrors-list" style="margin-bottom:6px"></div>
+    <div style="display:flex;gap:6px">
+      <input id="new-mirror-url" placeholder="https://mirror-host/stream.m3u8" style="flex:1">
+      <button class="btn-gray btn-sm" onclick="addMirror()" type="button">+ Add</button>
+    </div>
+  </div>
   <div class="mbtns">
     <button class="btn-gray" onclick="closeM()">Cancel</button>
     <button class="btn-green" onclick="save()">Save Channel</button>
@@ -937,7 +1156,8 @@ _CHANNELS = """<!DOCTYPE html><html lang="en"><head>
 </div>
 
 <script>
-let channels=[], editIdx=null, filterQ='', filterG='';
+let channels=[], editIdx=null, currentEditIdx=null, filterQ='', filterG='';
+let healthData={}, editMirrors=[];
 let previewData=[], previewSel=new Set(), existingUrls=new Set(), importSrcId=null;
 
 function bc(r){if(!r)return 'bsd';r=r.toLowerCase();
@@ -969,9 +1189,11 @@ function render(){
   document.getElementById('tbody').innerHTML=list.map(c=>{
     const i=channels.indexOf(c);
     const hasUrl=c.url&&!c.url.includes('YOUR_STREAM_URL');
-    return `<tr>
+    const slug=slugifyJS(c.name||'');
+    return `<tr data-slug="${slug}">
       <td class="sel-col"><input type="checkbox" class="row-chk" data-idx="${i}" onchange="updateBulkBtn()"></td>
       <td style="color:#374151">${i+1}</td>
+      <td class="hlt" style="width:72px"></td>
       <td><strong>${esc(c.name)}</strong>${c.source?`<span class="tag">${esc(c.source)}</span>`:''}</td>
       <td style="color:#4b5563">${esc(c.group)}</td>
       <td><span class="badge ${bc(c.resolution)}">${esc(c.resolution)||'—'}</span></td>
@@ -979,6 +1201,7 @@ function render(){
       <td><input class="url-cell ${hasUrl?'url-ok':'url-miss'}" value="${esc(c.url)}"
            placeholder="https://…" onchange="quickUrl(${i},this.value)"></td>
       <td style="white-space:nowrap">
+        <button class="btn-gray btn-sm" style="margin-right:3px" onclick="testOne(${i},'${esc(c.url||'')}')">Test</button>
         <button class="btn-blue btn-sm" style="margin-right:3px" onclick="openEdit(${i})">Edit</button>
         <button class="btn-red btn-sm" onclick="del(${i})">✕</button>
       </td>
@@ -1009,11 +1232,12 @@ function openAdd(){
   document.getElementById('modal').classList.add('open');
 }
 function openEdit(idx){
-  editIdx=idx;const c=channels[idx];
+  editIdx=idx;currentEditIdx=idx;const c=channels[idx];
   document.getElementById('mtitle').textContent='Edit: '+c.name;
   ['name','group','resolution','fps','bitrate','tvg_id','tvg_logo','url','source'].forEach(f=>
     document.getElementById('f-'+f).value=c[f]||'');
   document.getElementById('modal').classList.add('open');
+  loadMirrors(idx);
 }
 function closeM(){document.getElementById('modal').classList.remove('open');}
 async function save(){
@@ -1111,7 +1335,106 @@ async function doImport(){
 window._openPreviewForSource=(channels,title,srcId)=>{
   importSrcId=srcId; openPreview(channels,title);
 };
-load();
+
+function slugifyJS(t){
+  return t.toLowerCase().replace(/[^a-z0-9\s-]/g,'').replace(/[\s-]+/g,'-').replace(/^-+|-+$/g,'');
+}
+
+async function loadHealth(){
+  const rows=await(await fetch('/api/health')).json();
+  healthData={};
+  for(const r of rows){
+    if(!healthData[r.slug])healthData[r.slug]=[];
+    healthData[r.slug].push(r);
+  }
+  updateHealthUI();
+}
+
+function updateHealthUI(){
+  for(const[slug,rows] of Object.entries(healthData)){
+    const primary=rows.find(r=>!r.is_mirror);
+    if(!primary)continue;
+    const dot=statusDot(primary.status,primary.latency_ms);
+    document.querySelectorAll(`[data-slug="${slug}"] .hlt`).forEach(el=>el.innerHTML=dot);
+  }
+}
+
+function statusDot(status,latency){
+  const color=status==='ok'?'#16a34a':status==='timeout'?'#d97706':status==='error'?'#dc2626':'#374151';
+  const label=status==='ok'?(latency?latency+'ms':'OK'):status;
+  return `<span style="display:inline-flex;align-items:center;gap:3px">
+    <span style="width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0"></span>
+    <span style="font-size:.68rem;color:${color==='#374151'?'#374151':'inherit'}">${label}</span>
+  </span>`;
+}
+
+async function testOne(idx,url){
+  if(!url||url.includes('YOUR_STREAM_URL')){notify('No stream URL set','err');return;}
+  const ch=channels[idx];
+  const slug=slugifyJS(ch.name||'');
+  notify('Testing '+ch.name+'…','info');
+  const r=await(await fetch('/api/health/test',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({url,slug,is_mirror:0})
+  })).json();
+  const msg=r.status==='ok'
+    ?`✓ ${ch.name} — live (${r.latency_ms}ms)${r.stream_info?.resolution?' · '+r.stream_info.resolution:''}`
+    :`✗ ${ch.name} — ${r.status}: ${r.error_msg||''}`;
+  notify(msg,r.status==='ok'?'ok':'err');
+  loadHealth();
+}
+
+async function testAll(){
+  notify('Testing all channels in background…','info');
+  document.getElementById('test-all-btn').textContent='Testing…';
+  await fetch('/api/health/test_all',{method:'POST'});
+  let checks=0;
+  const poll=setInterval(async()=>{
+    await loadHealth();
+    checks++;
+    if(checks>20){
+      clearInterval(poll);
+      document.getElementById('test-all-btn').textContent='⚡ Test All';
+      notify('Health check complete');
+    }
+  },5000);
+}
+
+async function loadMirrors(idx){
+  const ms=await(await fetch('/api/channels/'+idx+'/mirrors')).json();
+  editMirrors=ms;
+  renderMirrors(idx);
+  document.getElementById('mirrors-section').style.display='block';
+}
+
+function renderMirrors(idx){
+  document.getElementById('mirrors-list').innerHTML=editMirrors.length
+    ?editMirrors.map((m,i)=>`<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+        <span style="flex:1;font-family:monospace;font-size:.72rem;color:#6b7280;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(m.url)}">${esc(m.url)}</span>
+        <span style="font-size:.7rem;color:${m.status==='ok'?'#4ade80':m.status==='error'?'#f87171':'#374151'}">${m.status}</span>
+        <button class="btn-red btn-sm" onclick="removeMirror(${idx},'${esc(m.url)}',${i})">✕</button>
+      </div>`).join('')
+    :'<p style="color:#374151;font-size:.78rem">No mirrors yet.</p>';
+}
+
+async function addMirror(){
+  const url=document.getElementById('new-mirror-url').value.trim();
+  if(!url)return;
+  if(currentEditIdx===null)return;
+  await fetch('/api/channels/'+currentEditIdx+'/mirrors',{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})
+  });
+  document.getElementById('new-mirror-url').value='';
+  loadMirrors(currentEditIdx);
+}
+
+async function removeMirror(idx,url,i){
+  await fetch('/api/channels/'+idx+'/mirrors/'+encodeURIComponent(url),{method:'DELETE'});
+  editMirrors.splice(i,1);
+  renderMirrors(idx);
+}
+
+load();loadHealth();
 </script></body></html>"""
 
 # ─── Sources page ─────────────────────────────────────────────────────────────
@@ -1435,6 +1758,7 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=_epg_loop,              daemon=True).start()
     threading.Thread(target=_source_autosync_loop,  daemon=True).start()
+    threading.Thread(target=_health_loop,            daemon=True).start()
     host = os.environ.get("SERVER_HOST", "localhost")
     print("[IPTV Manager] http://{}:8765".format(host))
     print("  M3U:   http://{}:8765/playlist.m3u".format(host))
