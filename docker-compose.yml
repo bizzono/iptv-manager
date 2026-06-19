@@ -1,0 +1,16 @@
+services:
+  iptv-manager:
+    build: .
+    container_name: iptv-manager
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - SERVER_HOST=${SERVER_HOST:-localhost}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/api/status')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
