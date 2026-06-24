@@ -244,13 +244,21 @@ def main():
 
     # Delete + re-add the playlist_server tuner to bust Jellyfin's M3U cache,
     # then trigger channel scan. The scheduled task alone caches and doesn't re-fetch.
+    # NOTE: GET /LiveTv/TunerHosts is not supported (405). Read ID from livetv.xml instead.
     try:
-        list_req = urllib.request.Request(
-            f'{JELLYFIN_URL}/LiveTv/TunerHosts',
-            headers={'Authorization': f'MediaBrowser Token="{JELLYFIN_TOKEN}"'}
-        )
-        hosts = json.loads(urllib.request.urlopen(list_req, timeout=5).read())
-        tuner_id = next((h['Id'] for h in hosts if '8765' in h.get('Url', '')), None)
+        import xml.etree.ElementTree as ET
+        livetv_xml = os.path.expanduser('~/.local/share/jellyfin/livetv.xml')
+        tuner_id = None
+        try:
+            tree = ET.parse(livetv_xml)
+            for host in tree.getroot().findall('.//TunerHostInfo'):
+                url_el = host.find('Url')
+                id_el = host.find('Id')
+                if url_el is not None and '8765' in (url_el.text or '') and id_el is not None:
+                    tuner_id = id_el.text
+                    break
+        except Exception:
+            pass
         if tuner_id:
             del_req = urllib.request.Request(
                 f'{JELLYFIN_URL}/LiveTv/TunerHosts?id={tuner_id}',
